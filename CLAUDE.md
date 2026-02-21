@@ -2,159 +2,137 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project Status
-
-Pre-implementation. The full specification lives in `docs/decipher-solidity-upgradoor-v2-prd.md` (V3). The README is a placeholder. No source code exists yet — this CLAUDE.md describes what to build.
-
 ## What This Is
 
-**decipher-solidity-upgradoor** is a Claude Code plugin that provides deterministic upgrade safety verification for Solidity smart contracts using Transparent Proxy (EIP-1967) and UUPS Proxy (EIP-1822 + EIP-1967) patterns. V1 scope: Transparent and UUPS only — no Beacon, Diamond, or custom proxy patterns.
+**decipher-solidity-upgradoor** is a Claude Code plugin providing deterministic upgrade safety verification for Solidity smart contracts using Transparent Proxy (EIP-1967) and UUPS Proxy (EIP-1822 + EIP-1967) patterns.
 
-The engine is deterministic (no LLM in the analysis path). Claude acts as the presentation layer: explaining findings, suggesting fixes, orchestrating workflow.
+The engine is deterministic — no LLM in the analysis path. Claude acts as the presentation layer, orchestrating the engine and explaining findings.
 
-## Tech Stack
+## Commands
 
-- **Language:** TypeScript strict mode, Node.js ≥ 18, ESM
-- **Build:** tsup (bundles all deps into `dist/`)
-- **Test:** vitest
-- **Blockchain RPC:** viem
-- **Plugin protocol:** `@modelcontextprotocol/sdk`
-- **CLI:** commander
-- **Validation:** zod
-- **Solidity tools:** Foundry (`forge`) for storage layout extraction and compilation
-
-## Repository Layout (to be created)
-
-```
-.claude-plugin/          # Claude Code plugin manifest
-  plugin.json            # Plugin manifest (name, version, author)
-  .mcp.json              # MCP server auto-registration
-  commands/              # Slash commands (check.md, detect.md)
-  skills/                # Auto-invoked skills (upgrade-safety/SKILL.md)
-  agents/                # Subagents (upgrade-reviewer.md)
-  hooks/                 # Lifecycle hooks (hooks.json, scripts/)
-engine/                  # Core deterministic engine (TypeScript)
-  src/
-    index.ts             # Public API exports
-    types.ts             # All shared TypeScript interfaces
-    engine.ts            # UpgradoorEngine orchestrator class
-    mcp-server.ts        # Thin MCP server wrapper
-    cli.ts               # Thin CLI wrapper
-    resolver/            # Input validation and source resolution
-    analyzers/           # Independent analysis modules
-    report/              # Report generators (markdown, JSON, fix-plan)
-    baseline/            # Storage layout snapshot persistence
-    utils/               # viem helpers, forge/solc wrappers, API clients
-  package.json
-  tsconfig.json
-  tsup.config.ts
-upgradoor.config.json    # Project-level config (RPC, API keys, options)
-.upgradoor/              # Local baseline cache (gitignored)
-docs/                    # PRD and design docs
-```
-
-## Commands (once engine/ exists)
+All commands run from the repo root unless noted.
 
 ```bash
-cd engine
-npm install
-npm run build       # tsup → dist/mcp-server.js, dist/cli.js
-npm test            # vitest (all tests run twice to verify determinism)
-npm run typecheck   # tsc --noEmit
+# Build (compiles engine/src → engine/dist/)
+npm run build
+
+# Test (runs vitest inside engine/)
+npm test
+
+# Type-check (no emit)
+cd engine && npm run typecheck
+
+# Validate Claude Code plugin manifest
+npm run validate   # runs: claude plugin validate .
+
+# Watch mode (rebuild on save)
+cd engine && npm run dev
 ```
 
-Plugin validation (once .claude-plugin/ exists):
+Run a single test file:
 ```bash
-claude plugin validate .
+cd engine && npx vitest run tests/analyzers/storage-layout.test.ts
+```
+
+Invoke the engine directly (requires `forge` in PATH and a running RPC):
+```bash
+node engine/dist/check.js \
+  --proxy <0x...> \
+  --old <path/to/V1.sol> \
+  --new <path/to/V2.sol> \
+  --rpc <rpc-url>
 ```
 
 ## Architecture
 
-### Two distribution surfaces, one engine
+### Two surfaces, one engine
 
-1. **Claude Code Plugin** — installed via `/plugin install decipher-upgradoor@decipher-marketplace`. Provides slash commands, skills, subagents, hooks, and an auto-registered MCP server.
-2. **Standalone CLI/npm package** — same engine, different surface. Exit codes for CI automation.
+1. **Claude Code Plugin** — `.claude-plugin/` manifest + `commands/check.md` slash command. Claude invokes `engine/dist/check.js` via Bash and formats the JSON output.
+2. **Engine** — `engine/` contains all analysis logic. Compiles to `engine/dist/check.js` (bundled by tsup, deps inlined). `dist/` is committed so plugin users need no build step.
 
-### Engine pipeline
+### Engine pipeline (`engine/src/`)
 
 ```
-Inputs (proxy address, new impl, RPC)
-  → InputResolver         (validate + resolve sources via cascade below)
-  → Analyzer Pipeline     (modules run in parallel after dependencies)
-  → ReportAggregator      (combine findings, compute verdict)
-  → Output                (Markdown report + JSON)
+check.ts (CLI entry)
+  → UpgradoorEngine.analyze()        engine.ts
+      → validateFoundry()             forge --version check
+      → detectProxy()                 analyzers/proxy-detection.ts
+      → resolveImplementations()      resolver/input-resolver.ts
+          → forgeBuild()              utils/forge.ts (forge build)
+          → extractStorageLayout()    resolver/layout-extractor.ts (forge inspect)
+          → extractAbi()              resolver/abi-extractor.ts (forge inspect)
+      → [parallel] all analyzers     analyzers/*.ts
+      → aggregateResults()            report/aggregator.ts
+      → generateMarkdownReport()      report/markdown-report.ts
 ```
 
-### Source resolution cascade (InputResolver)
+`resolveImplementations` uses `findProjectRoot` (walks up looking for `foundry.toml` or `package.json`) so the project root is auto-detected from the provided `.sol` file paths.
 
-1. User-provided local path
-2. Git reference (`git:commit:path`)
-3. Baseline cache (`.upgradoor/{chainId}/{proxyAddress}`)
-4. Etherscan verified source
-5. Sourcify verified source
-6. Bytecode-only degraded mode
+### Analyzer isolation
 
-### Analyzer modules (all independent, all deterministic)
+Each analyzer is a pure function returning `AnalyzerResult`:
+```ts
+{ status: "completed"; findings: Finding[] }
+| { status: "skipped"; reason: string }
+| { status: "errored"; error: string }
+```
+All analyzers run via `Promise.allSettled` — one failure never blocks others. `proxy-detection` is the only gating step: specific finding codes (`PROXY-001`, `PROXY-002`, `PROXY-003`, `PROXY-005`) cause all downstream analyzers to be skipped.
 
-| Module | Finding prefix | What it checks |
-|---|---|---|
-| `proxy-detection` | — | EIP-1967 slot reading → Transparent vs UUPS |
-| `storage-layout` | `STOR-*` | Collisions, deletions, type changes, inheritance reordering |
-| `abi-diff` | `ABI-*` | Selector removals, collisions, signature changes |
-| `uups-safety` | `UUPS-*` | `_authorizeUpgrade` presence/gating, `proxiableUUID` |
-| `transparent-safety` | `TRAN-*` | Admin validation, function selector conflicts |
-| `initializer-integrity` | `INIT-*` | Constructor storage writes, `initializer` modifiers, version regressions |
-| `access-control-regression` | `ACL-*` | Removed modifiers, visibility widening |
-| `inheritance-check` | `INH-*` | C3 linearization order |
+Only one of `uups-safety` or `transparent-safety` runs per analysis (keyed by detected proxy type); the other is marked `skipped`.
 
-Each analyzer returns `{ status: "completed|skipped|errored", findings?: [...], reason?: "..." }`. One failure never blocks others.
+### Finding codes and severity
 
-### Verdict computation
+Each finding has a namespaced code: `STOR-*`, `ABI-*`, `UUPS-*`, `TRAN-*`, `INIT-*`, `ACL-*`, `INH-*`. Severity levels: `CRITICAL | HIGH | MEDIUM | LOW`.
 
-- Any CRITICAL-capable analyzer errors → `INCOMPLETE` (never `SAFE`)
-- Any `CRITICAL` finding → `UNSAFE`
-- Any `HIGH` finding → `UNSAFE`
+Verdict rules (in `report/aggregator.ts`):
+- Any CRITICAL-capable analyzer errors → `INCOMPLETE`
+- Any `CRITICAL` or `HIGH` finding → `UNSAFE`
 - Any `MEDIUM` finding → `REVIEW_REQUIRED`
 - Otherwise → `SAFE`
 
-### Storage layout validation rules
-
-- Primary key: `slot + offset + canonicalType` (labels are informational only)
-- Type aliases normalized (`uint` → `uint256`)
-- Storage gaps validated: `N_new + V_new == N_old`
-
-### CLI exit codes
+### CLI exit codes (`check.ts`)
 
 | Code | Meaning |
 |---|---|
 | 0 | SAFE |
-| 1 | CRITICAL finding |
-| 2 | HIGH finding |
-| 3 | MEDIUM finding |
-| 4 | INCOMPLETE (analyzer error) |
-| 10–12 | Input/config/network errors |
+| 1 | UNSAFE (CRITICAL) |
+| 2 | UNSAFE (HIGH) |
+| 3 | REVIEW_REQUIRED |
+| 4 | INCOMPLETE |
+| 10 | Input/config error |
+| 12 | Runtime error |
 
-### Configuration precedence
+### Forge integration
 
-CLI flags > environment variables (`UPGRADOOR_*`) > `upgradoor.config.json` > `.upgradoor/config.json` > defaults
+All Foundry calls go through `utils/forge.ts`:
+- `forgeBuild(projectRoot)` — compiles the project
+- `forgeInspectStorageLayout(projectRoot, file, contractName)` — storage layout JSON
+- `forgeInspectAbi(projectRoot, file, contractName)` — ABI JSON
 
-## MCP Tools (exposed by mcp-server.ts)
+Contract target format for `forge inspect`: `<relative-path-from-root>:<ContractName>`.
 
-- `analyze_upgrade` — full pipeline run
-- `check_proxy_type` — EIP-1967 slot detection only
-- `get_baseline` — retrieve cached storage layout snapshot
+### Contract name detection
 
-## Plugin Components
+`input-resolver.ts` derives the contract name from the filename stem (`path.basename(file, ".sol")`). Override with `options.contractName` in `EngineInput`.
 
-- **`/decipher-upgradoor:check`** — Full upgrade safety analysis (slash command)
-- **`/decipher-upgradoor:detect`** — Quick proxy type detection (slash command)
-- **`upgrade-safety` skill** — Auto-invoked when Claude detects upgrade work in context
-- **`upgrade-reviewer` subagent** — Isolated context deep-dive review
-- **Pre-deploy hook** — Warns before `forge script` commands that deploy upgrades
+## Plugin Structure
+
+```
+.claude-plugin/plugin.json   # Plugin manifest
+commands/check.md            # /decipher-upgradoor:check slash command
+engine/src/                  # TypeScript source
+engine/dist/                 # Compiled output (committed)
+engine/tests/                # vitest tests, mirroring src/
+```
+
+The `commands/check.md` slash command drives the full workflow: input validation → `forge build` → `node engine/dist/check.js` → JSON parse → present findings → write `upgrade_safety_report.md`.
 
 ## Key Conventions
 
-- Every test runs **twice** — second run verifies byte-for-byte identical output (determinism requirement)
-- `dist/` is committed — no build step for plugin users
-- Finding codes are standardized strings like `STOR-001`, `UUPS-002`, `ACL-001`; each has severity, confidence, title, description, location, remediation
-- No LLM calls inside the engine; findings are computed, not inferred
+- `dist/` is committed — plugin users never run a build step.
+- Storage layout primary key: `slot + offset + canonicalType` (labels are informational).
+- Type aliases are normalized: `uint` → `uint256`, etc.
+- Storage gaps validated: `N_new + V_new == N_old`.
+- No LLM calls inside the engine — all findings are computed, never inferred.
+- `UpgradoorError` is the only typed error class; all engine throws use it with an `ErrorCode`. The CLI catches it and exits with code 10.
+- `ETHEREUM_MAINNET_RPC` env var is the fallback RPC URL when `--rpc` is not provided.
