@@ -1,0 +1,10 @@
+{
+  "name": "decipher-solidity-upgradoor",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "cd engine && npm run build",
+    "test": "cd engine && npm test",
+    "validate": "claude plugin validate ."
+  }
+}

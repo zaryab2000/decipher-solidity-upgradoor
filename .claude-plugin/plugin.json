@@ -1,0 +1,21 @@
+{
+  "name": "decipher-solidity-upgradoor",
+  "description": "Deterministic upgrade safety analyzer for Transparent & UUPS proxy contracts.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Zaryab",
+    "url": "https://github.com/zaryab2000"
+  },
+  "repository": "https://github.com/zaryab-decipher/decipher-solidity-upgradoor",
+  "license": "MIT",
+  "keywords": [
+    "solidity",
+    "proxy",
+    "upgrade",
+    "safety",
+    "foundry",
+    "eip-1967",
+    "uups",
+    "transparent-proxy"
+  ]
+}

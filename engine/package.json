@@ -1,0 +1,22 @@
+{
+  "name": "decipher-solidity-upgradoor-engine",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "viem": "2.21.54",
+    "zod": "3.24.1"
+  },
+  "devDependencies": {
+    "typescript": "5.7.3",
+    "tsup": "8.3.5",
+    "vitest": "2.1.9",
+    "@types/node": "22.10.2"
+  }
+}

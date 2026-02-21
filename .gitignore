@@ -1,2 +1,17 @@
+# Secrets
 .env
+
+# Private internal docs
 docs-internal/
+
+# macOS metadata
+.DS_Store
+
+# Node.js
+engine/node_modules/
+
+# Local Claude Code session state
+.claude/
+
+# Runtime baseline cache (generated at analysis time)
+.upgradoor/
