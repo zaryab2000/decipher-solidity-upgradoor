@@ -108,8 +108,12 @@ export function analyzeAbiDiff(oldAbi: ExtractedAbi, newAbi: ExtractedAbi): Anal
   }
 
   // ABI-006: Event signature changed / ABI-007: Event removed
+  // Primary key is topic0 (keccak256 of signature). For same-name events with the same
+  // topic0, also compare indexed attributes — indexed changes break log filtering even
+  // though topic0 is identical.
   const oldEvents = new Map(oldAbi.events.map((e) => [e.topic0, e]));
   const newEvents = new Map(newAbi.events.map((e) => [e.topic0, e]));
+
   for (const [topic, oldEvent] of oldEvents) {
     if (!newEvents.has(topic)) {
       const sameNameInNew = newAbi.events.find((e) => e.name === oldEvent.name);
@@ -140,6 +144,34 @@ export function analyzeAbiDiff(oldAbi: ExtractedAbi, newAbi: ExtractedAbi): Anal
           details: { topic, signature: oldEvent.signature },
           remediation:
             "If off-chain systems index this event, removing it breaks their data pipelines.",
+        });
+      }
+    } else {
+      // Same topic0: check if indexed attributes changed (ABI-006 secondary check).
+      // indexed changes don't affect topic0 but break log filtering and ABI decoders.
+      const newEvent = newEvents.get(topic)!;
+      const oldIndexed = oldEvent.indexedInputs ?? [];
+      const newIndexed = newEvent.indexedInputs ?? [];
+      const indexedChanged =
+        oldIndexed.length === newIndexed.length &&
+        oldIndexed.some((inp, i) => inp.indexed !== newIndexed[i]?.indexed);
+      if (indexedChanged) {
+        findings.push({
+          code: "ABI-006",
+          severity: "HIGH",
+          confidence: "HIGH_CONFIDENCE",
+          title: "Event indexed attribute changed",
+          description:
+            `Event "${oldEvent.name}" has the same topic0 but different indexed attributes. ` +
+            `Log decoders and off-chain filters that rely on indexed fields will misparse events.`,
+          details: {
+            signature: oldEvent.signature,
+            oldIndexed: oldIndexed.map((i) => i.indexed),
+            newIndexed: newIndexed.map((i) => i.indexed),
+          },
+          remediation:
+            "Changing indexed attributes alters ABI decoding for event parameters. " +
+            "Update all off-chain indexers.",
         });
       }
     }

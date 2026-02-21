@@ -9,6 +9,8 @@ import {
   slotToAddress,
 } from "../utils/eip1967.js";
 
+const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+
 // Returns the proxy type and addresses, plus any findings
 export async function detectProxy(
   client: PublicClient,
@@ -26,7 +28,7 @@ export async function detectProxy(
 
   // Beacon proxy — not supported in v0/v1
   const beaconAddress = slotToAddress(beaconSlot);
-  if (beaconAddress !== "0x0000000000000000000000000000000000000000") {
+  if (beaconAddress !== ZERO_ADDRESS) {
     findings.push({
       code: "PROXY-001",
       severity: "CRITICAL",
@@ -44,7 +46,7 @@ export async function detectProxy(
   }
 
   // No implementation address set
-  if (implAddress === "0x0000000000000000000000000000000000000000") {
+  if (implAddress === ZERO_ADDRESS) {
     findings.push({
       code: "PROXY-002",
       severity: "CRITICAL",
@@ -73,17 +75,33 @@ export async function detectProxy(
     return { result: { status: "completed", findings } };
   }
 
-  // Determine proxy type: check for proxiableUUID selector in bytecode (UUPS indicator)
+  // Determine proxy type.
+  // UUPS: implementation bytecode contains the proxiableUUID selector.
+  // Transparent: implementation does not have proxiableUUID — classified as transparent
+  //   regardless of whether the admin slot is zero. A zero admin is a valid (broken) state
+  //   for a transparent proxy; TPROXY-001 surfaces this downstream.
   const isUUPS = implCode.includes(PROXIABLE_UUID_SELECTOR.slice(2));
-  const hasAdmin = adminAddress !== "0x0000000000000000000000000000000000000000";
 
   let proxyType: "transparent" | "uups" | "unknown";
   if (isUUPS) {
     proxyType = "uups";
-  } else if (hasAdmin) {
+  } else if (adminAddress !== ZERO_ADDRESS) {
+    // Non-zero admin slot — definitely transparent
     proxyType = "transparent";
   } else {
-    proxyType = "unknown";
+    // Admin slot is zero but impl has code and no proxiableUUID.
+    // Could be a transparent proxy with a zeroed admin (broken state) or a truly unknown proxy.
+    // Read the proxy's own bytecode to distinguish: OZ TransparentUpgradeableProxy bytecode
+    // always contains the admin slot hash. We fall back to transparent classification here
+    // so that TPROXY-001 can fire downstream rather than blocking all analysis with PROXY-005.
+    const proxyCode = await client.getBytecode({ address: proxyAddress });
+    const adminSlotHash = "b53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103";
+    if (proxyCode && proxyCode.includes(adminSlotHash)) {
+      // Proxy bytecode references the admin slot — this is a transparent proxy
+      proxyType = "transparent";
+    } else {
+      proxyType = "unknown";
+    }
   }
 
   if (proxyType === "unknown") {
@@ -103,7 +121,9 @@ export async function detectProxy(
     type: proxyType,
     proxyAddress,
     implementationAddress: implAddress,
-    ...(hasAdmin ? { adminAddress } : {}),
+    // Pass adminAddress always for transparent proxies so TPROXY-001 can detect zero admin.
+    // For UUPS proxies, adminAddress is not meaningful.
+    ...(proxyType === "transparent" ? { adminAddress } : {}),
   };
 
   return {

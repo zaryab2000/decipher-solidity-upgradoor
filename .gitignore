@@ -15,3 +15,7 @@ engine/node_modules/
 
 # Runtime baseline cache (generated at analysis time)
 .upgradoor/
+
+# Local end-to-end test fixtures (not part of plugin distribution)
+test-fixtures/
+.gitmodules

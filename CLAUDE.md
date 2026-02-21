@@ -82,7 +82,9 @@ Only one of `uups-safety` or `transparent-safety` runs per analysis (keyed by de
 
 ### Finding codes and severity
 
-Each finding has a namespaced code: `STOR-*`, `ABI-*`, `UUPS-*`, `TRAN-*`, `INIT-*`, `ACL-*`, `INH-*`. Severity levels: `CRITICAL | HIGH | MEDIUM | LOW`.
+Each finding has a namespaced code: `STOR-*`, `ABI-*`, `UUPS-*`, `TPROXY-*`, `INIT-*`, `ACL-*`. Severity levels: `CRITICAL | HIGH | MEDIUM | LOW`.
+
+See `docs/plugin-capabilities.md` for the full verified list including known broken/unreachable findings.
 
 Verdict rules (in `report/aggregator.ts`):
 - Any CRITICAL-capable analyzer errors → `INCOMPLETE`
@@ -130,9 +132,24 @@ The `commands/check.md` slash command drives the full workflow: input validation
 ## Key Conventions
 
 - `dist/` is committed — plugin users never run a build step.
-- Storage layout primary key: `slot + offset + canonicalType` (labels are informational).
+- Storage layout primary key: `slot + offset` (canonicalType is compared after matching). Labels are informational.
 - Type aliases are normalized: `uint` → `uint256`, etc.
-- Storage gaps validated: `N_new + V_new == N_old`.
+- Storage gaps matched by **slot position** (`isGapEntry` = label matches `/gap$/i` AND type starts with `uint256[`). Gap entries are excluded from the main comparison loop (STOR-003/004/010 never fire on gaps).
+- Gap validation invariant: `newGapSize + newVarsAdded == oldGapSize`. `newVarsAdded` = count of non-gap entries beyond `maxOldSlot` (same set reported by STOR-009).
 - No LLM calls inside the engine — all findings are computed, never inferred.
 - `UpgradoorError` is the only typed error class; all engine throws use it with an `ErrorCode`. The CLI catches it and exits with code 10.
 - `ETHEREUM_MAINNET_RPC` env var is the fallback RPC URL when `--rpc` is not provided.
+- `ast = true` and `extra_output = ["storageLayout"]` are **required** in `foundry.toml` for AST-based analyzers (INIT, ACL, UUPS) to function. Without `ast = true`, INIT-002 fires on every run.
+
+## Known Bugs (as of V3 testing)
+
+1. **STOR-001/002 not firing** — slot-based matching sees a type change (STOR-003) instead of deletion/insertion when a gap array absorbs or shifts into the affected slot. Verdicts are still UNSAFE/CRITICAL.
+2. **STOR-007 partial** — only fires when new vars are appended *after* the gap. When vars are added *before* the gap (shifting its slot), STOR-008 fires instead. Verdict stays UNSAFE/HIGH.
+3. **TPROXY-001 unreachable** — zero admin slot causes proxy classification to emit PROXY-005 (INCOMPLETE) instead of reaching transparent-safety where TPROXY-001 would fire (UNSAFE/CRITICAL). This is the only bug where the verdict itself is wrong.
+
+## End-to-End Testing
+
+Test fixtures live in `test-fixtures/` (gitignored — local dev only). Test plans and logs are in `docs/`:
+- `docs/test-plan_v2.md` — current test plan (33 scenarios)
+- `docs/test-logs-v3.md` — most recent full run results
+- `docs/v1-vs-v2-comparison.md` — iteration comparison across V1/V2/V3

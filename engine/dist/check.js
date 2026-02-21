@@ -4438,6 +4438,7 @@ function slotToAddress(slotValue) {
 }
 
 // src/analyzers/proxy-detection.ts
+var ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 async function detectProxy(client, proxyAddress) {
   const findings = [];
   const implSlot = await readStorageSlot(client, proxyAddress, IMPLEMENTATION_SLOT);
@@ -4446,7 +4447,7 @@ async function detectProxy(client, proxyAddress) {
   const implAddress = slotToAddress(implSlot);
   const adminAddress = slotToAddress(adminSlot);
   const beaconAddress = slotToAddress(beaconSlot);
-  if (beaconAddress !== "0x0000000000000000000000000000000000000000") {
+  if (beaconAddress !== ZERO_ADDRESS) {
     findings.push({
       code: "PROXY-001",
       severity: "CRITICAL",
@@ -4458,7 +4459,7 @@ async function detectProxy(client, proxyAddress) {
     });
     return { result: { status: "completed", findings } };
   }
-  if (implAddress === "0x0000000000000000000000000000000000000000") {
+  if (implAddress === ZERO_ADDRESS) {
     findings.push({
       code: "PROXY-002",
       severity: "CRITICAL",
@@ -4484,14 +4485,19 @@ async function detectProxy(client, proxyAddress) {
     return { result: { status: "completed", findings } };
   }
   const isUUPS = implCode.includes(PROXIABLE_UUID_SELECTOR.slice(2));
-  const hasAdmin = adminAddress !== "0x0000000000000000000000000000000000000000";
   let proxyType;
   if (isUUPS) {
     proxyType = "uups";
-  } else if (hasAdmin) {
+  } else if (adminAddress !== ZERO_ADDRESS) {
     proxyType = "transparent";
   } else {
-    proxyType = "unknown";
+    const proxyCode = await client.getBytecode({ address: proxyAddress });
+    const adminSlotHash = "b53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103";
+    if (proxyCode && proxyCode.includes(adminSlotHash)) {
+      proxyType = "transparent";
+    } else {
+      proxyType = "unknown";
+    }
   }
   if (proxyType === "unknown") {
     findings.push({
@@ -4509,7 +4515,9 @@ async function detectProxy(client, proxyAddress) {
     type: proxyType,
     proxyAddress,
     implementationAddress: implAddress,
-    ...hasAdmin ? { adminAddress } : {}
+    // Pass adminAddress always for transparent proxies so TPROXY-001 can detect zero admin.
+    // For UUPS proxies, adminAddress is not meaningful.
+    ...proxyType === "transparent" ? { adminAddress } : {}
   };
   return {
     proxyInfo,
@@ -4616,7 +4624,11 @@ async function extractAbi(projectRoot, solFile, contractName) {
         topic0: keccak256(toHex(new TextEncoder().encode(sig))),
         signature: sig,
         name: item.name,
-        inputs: inputs.map((i) => i.type)
+        inputs: inputs.map((i) => i.type),
+        indexedInputs: inputs.map((i) => ({
+          type: i.type,
+          indexed: i["indexed"] === true
+        }))
       });
     }
   }
@@ -4673,12 +4685,21 @@ async function resolveImplementations(input) {
 }
 
 // src/analyzers/storage-layout.ts
+var GAP_LABEL_RE = /gap$/i;
+function isGapEntry(entry) {
+  return GAP_LABEL_RE.test(entry.label) && entry.canonicalType.startsWith("uint256[");
+}
 function analyzeStorageLayout(oldLayout, newLayout) {
   const findings = [];
   const oldBySlotOffset = new Map(oldLayout.map((e) => [`${e.slot}:${e.offset}`, e]));
   const newBySlotOffset = new Map(newLayout.map((e) => [`${e.slot}:${e.offset}`, e]));
   for (const [key, oldEntry] of oldBySlotOffset) {
+    if (isGapEntry(oldEntry)) continue;
     if (!newBySlotOffset.has(key)) {
+      const appearsAtHigherSlot = newLayout.some(
+        (e) => e.label === oldEntry.label && e.slot > oldEntry.slot
+      );
+      if (appearsAtHigherSlot) continue;
       findings.push({
         code: "STOR-001",
         severity: "CRITICAL",
@@ -4746,8 +4767,9 @@ function analyzeStorageLayout(oldLayout, newLayout) {
       });
     }
   }
-  const maxOldSlot = Math.max(...oldLayout.map((e) => e.slot), 0);
+  const maxOldSlot = Math.max(...oldLayout.filter((e) => !isGapEntry(e)).map((e) => e.slot), 0);
   for (const newEntry of newLayout) {
+    if (isGapEntry(newEntry)) continue;
     if (!oldBySlotOffset.has(`${newEntry.slot}:${newEntry.offset}`) && newEntry.slot <= maxOldSlot) {
       findings.push({
         code: "STOR-002",
@@ -4762,7 +4784,7 @@ function analyzeStorageLayout(oldLayout, newLayout) {
     }
   }
   const newVars = newLayout.filter(
-    (e) => !oldBySlotOffset.has(`${e.slot}:${e.offset}`) && e.slot > maxOldSlot
+    (e) => !isGapEntry(e) && !oldBySlotOffset.has(`${e.slot}:${e.offset}`) && e.slot > maxOldSlot
   );
   if (newVars.length > 0) {
     findings.push({
@@ -4777,45 +4799,38 @@ function analyzeStorageLayout(oldLayout, newLayout) {
       remediation: "Ensure the storage gap (if any) was decremented by the correct number of slots."
     });
   }
-  validateGaps(oldLayout, newLayout, findings);
+  const totalNewVarsAdded = newVars.length;
+  validateGaps(oldLayout, newLayout, findings, totalNewVarsAdded);
   return { status: "completed", findings };
 }
-function validateGaps(oldLayout, newLayout, findings) {
-  const gapRegex = /gap$/i;
-  const oldGaps = oldLayout.filter(
-    (e) => gapRegex.test(e.label) && e.canonicalType.startsWith("uint256[")
-  );
-  const newGaps = newLayout.filter(
-    (e) => gapRegex.test(e.label) && e.canonicalType.startsWith("uint256[")
-  );
+function validateGaps(oldLayout, newLayout, findings, totalNewVarsAdded) {
+  const oldGaps = oldLayout.filter(isGapEntry);
+  const newGaps = newLayout.filter(isGapEntry);
   for (const oldGap of oldGaps) {
     const oldN = extractArraySize(oldGap.canonicalType);
-    const matchingNewGap = newGaps.find((g) => g.contractOrigin === oldGap.contractOrigin);
+    const matchingNewGap = newGaps.find((g) => g.slot === oldGap.slot);
     if (!matchingNewGap) {
       findings.push({
         code: "STOR-008",
         severity: "HIGH",
         confidence: "HIGH_CONFIDENCE",
         title: "Storage gap removed",
-        description: `Storage gap "${oldGap.label}" in ${oldGap.contractOrigin} was removed entirely in the new implementation.`,
-        details: { oldGapSize: oldN, contract: oldGap.contractOrigin },
+        description: `Storage gap "${oldGap.label}" at slot ${oldGap.slot} was removed entirely in the new implementation.`,
+        details: { oldGapSize: oldN, slot: oldGap.slot },
         location: { slot: oldGap.slot, contract: oldGap.contractOrigin },
         remediation: "Do not remove storage gaps. If adding new variables, decrement the gap size by the number of new slots consumed."
       });
       continue;
     }
     const newN = extractArraySize(matchingNewGap.canonicalType);
-    const newVarsAfterGap = newLayout.filter(
-      (e) => e.contractOrigin === oldGap.contractOrigin && e.slot > oldGap.slot && !gapRegex.test(e.label)
-    ).length;
-    if (newN + newVarsAfterGap < oldN) {
+    if (newN + totalNewVarsAdded < oldN) {
       findings.push({
         code: "STOR-007",
         severity: "HIGH",
         confidence: "HIGH_CONFIDENCE",
         title: "Storage gap insufficient",
-        description: `Gap shrank by ${oldN - newN} slots but only ${newVarsAfterGap} new variable(s) added. Expected ${newN} + ${newVarsAfterGap} = ${newN + newVarsAfterGap} >= ${oldN}.`,
-        details: { oldGapSize: oldN, newGapSize: newN, newVarsAdded: newVarsAfterGap },
+        description: `Gap shrank by ${oldN - newN} slots but only ${totalNewVarsAdded} new variable(s) added. Expected ${newN} + ${totalNewVarsAdded} = ${newN + totalNewVarsAdded} >= ${oldN}.`,
+        details: { oldGapSize: oldN, newGapSize: newN, newVarsAdded: totalNewVarsAdded },
         location: { slot: matchingNewGap.slot, contract: oldGap.contractOrigin },
         remediation: "The gap must decrease by exactly the number of new storage slots used. Check that N_new + V_new == N_old."
       });
@@ -4938,6 +4953,26 @@ function analyzeAbiDiff(oldAbi, newAbi) {
           remediation: "If off-chain systems index this event, removing it breaks their data pipelines."
         });
       }
+    } else {
+      const newEvent = newEvents.get(topic);
+      const oldIndexed = oldEvent.indexedInputs ?? [];
+      const newIndexed = newEvent.indexedInputs ?? [];
+      const indexedChanged = oldIndexed.length === newIndexed.length && oldIndexed.some((inp, i) => inp.indexed !== newIndexed[i]?.indexed);
+      if (indexedChanged) {
+        findings.push({
+          code: "ABI-006",
+          severity: "HIGH",
+          confidence: "HIGH_CONFIDENCE",
+          title: "Event indexed attribute changed",
+          description: `Event "${oldEvent.name}" has the same topic0 but different indexed attributes. Log decoders and off-chain filters that rely on indexed fields will misparse events.`,
+          details: {
+            signature: oldEvent.signature,
+            oldIndexed: oldIndexed.map((i) => i.indexed),
+            newIndexed: newIndexed.map((i) => i.indexed)
+          },
+          remediation: "Changing indexed attributes alters ABI decoding for event parameters. Update all off-chain indexers."
+        });
+      }
     }
   }
   return { status: "completed", findings };
@@ -5011,19 +5046,21 @@ async function analyzeUupsSafety(projectRoot, newContractFile, newContractName) 
   }
   const fn = fnNode;
   const body = fn["body"];
-  if (!body || !body["statements"] || body["statements"].length === 0) {
+  const bodyEmpty = !body || !body["statements"] || body["statements"].length === 0;
+  const hasAC = hasAccessControl(fnNode);
+  if (bodyEmpty && !hasAC) {
     findings.push({
       code: "UUPS-002",
       severity: "CRITICAL",
       confidence: "HIGH_CONFIDENCE",
-      title: "_authorizeUpgrade has empty body",
-      description: "The _authorizeUpgrade function exists but has an empty body. Anyone can call upgradeTo() to upgrade the proxy.",
+      title: "_authorizeUpgrade has empty body with no access control",
+      description: "The _authorizeUpgrade function has an empty body and no access control modifier. Anyone can call upgradeTo() to upgrade the proxy.",
       details: { contractName: newContractName },
       remediation: "Add access control: `function _authorizeUpgrade(address) internal override onlyOwner {}`"
     });
     return { status: "completed", findings };
   }
-  if (!hasAccessControl(fnNode)) {
+  if (!bodyEmpty && !hasAC) {
     findings.push({
       code: "UUPS-003",
       severity: "CRITICAL",

@@ -92,16 +92,21 @@ export async function analyzeUupsSafety(
 
   const fn = fnNode as Record<string, unknown>;
   const body = fn["body"] as Record<string, unknown> | null;
+  const bodyEmpty = !body || !body["statements"] || (body["statements"] as unknown[]).length === 0;
 
-  if (!body || !body["statements"] || (body["statements"] as unknown[]).length === 0) {
+  // Check access control first — a modifier-only body (e.g. `onlyOwner {}`) is correct.
+  // UUPS-002 only fires when the body is empty AND there is no access control at all.
+  const hasAC = hasAccessControl(fnNode);
+
+  if (bodyEmpty && !hasAC) {
     findings.push({
       code: "UUPS-002",
       severity: "CRITICAL",
       confidence: "HIGH_CONFIDENCE",
-      title: "_authorizeUpgrade has empty body",
+      title: "_authorizeUpgrade has empty body with no access control",
       description:
-        "The _authorizeUpgrade function exists but has an empty body. Anyone can call upgradeTo() " +
-        "to upgrade the proxy.",
+        "The _authorizeUpgrade function has an empty body and no access control modifier. " +
+        "Anyone can call upgradeTo() to upgrade the proxy.",
       details: { contractName: newContractName },
       remediation:
         "Add access control: `function _authorizeUpgrade(address) internal override onlyOwner {}`",
@@ -109,7 +114,7 @@ export async function analyzeUupsSafety(
     return { status: "completed", findings };
   }
 
-  if (!hasAccessControl(fnNode)) {
+  if (!bodyEmpty && !hasAC) {
     findings.push({
       code: "UUPS-003",
       severity: "CRITICAL",

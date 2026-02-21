@@ -1,5 +1,11 @@
 import type { CanonicalStorageEntry, AnalyzerResult, Finding } from "../types.js";
 
+const GAP_LABEL_RE = /gap$/i;
+
+function isGapEntry(entry: CanonicalStorageEntry): boolean {
+  return GAP_LABEL_RE.test(entry.label) && entry.canonicalType.startsWith("uint256[");
+}
+
 export function analyzeStorageLayout(
   oldLayout: CanonicalStorageEntry[],
   newLayout: CanonicalStorageEntry[],
@@ -11,8 +17,21 @@ export function analyzeStorageLayout(
   const newBySlotOffset = new Map(newLayout.map((e) => [`${e.slot}:${e.offset}`, e]));
 
   // STOR-001: Variable deleted (exists in old, not in new at same slot+offset)
+  // STOR-003: Type width changed at same slot+offset
+  // STOR-004: Type semantics changed at same slot+offset
+  // STOR-010: Variable renamed at same slot+offset
   for (const [key, oldEntry] of oldBySlotOffset) {
+    // Skip gap entries — size changes are handled exclusively by validateGaps()
+    if (isGapEntry(oldEntry)) continue;
+
     if (!newBySlotOffset.has(key)) {
+      // Before emitting STOR-001, check if the label moved to a higher slot (insertion shifted it).
+      // If so, STOR-002 will handle the shifted variable — suppress the deletion finding.
+      const appearsAtHigherSlot = newLayout.some(
+        (e) => e.label === oldEntry.label && e.slot > oldEntry.slot,
+      );
+      if (appearsAtHigherSlot) continue;
+
       findings.push({
         code: "STOR-001",
         severity: "CRITICAL",
@@ -101,8 +120,11 @@ export function analyzeStorageLayout(
   }
 
   // STOR-002: Variable inserted in middle
-  const maxOldSlot = Math.max(...oldLayout.map((e) => e.slot), 0);
+  // A new non-gap entry appears at a slot within the old layout range, at a slot:offset
+  // that didn't exist in old. This is an insertion that shifts subsequent variables.
+  const maxOldSlot = Math.max(...oldLayout.filter((e) => !isGapEntry(e)).map((e) => e.slot), 0);
   for (const newEntry of newLayout) {
+    if (isGapEntry(newEntry)) continue;
     if (!oldBySlotOffset.has(`${newEntry.slot}:${newEntry.offset}`) && newEntry.slot <= maxOldSlot) {
       findings.push({
         code: "STOR-002",
@@ -123,7 +145,7 @@ export function analyzeStorageLayout(
 
   // STOR-009: New variable appended (safe if gap was decremented correctly)
   const newVars = newLayout.filter(
-    (e) => !oldBySlotOffset.has(`${e.slot}:${e.offset}`) && e.slot > maxOldSlot,
+    (e) => !isGapEntry(e) && !oldBySlotOffset.has(`${e.slot}:${e.offset}`) && e.slot > maxOldSlot,
   );
   if (newVars.length > 0) {
     findings.push({
@@ -141,7 +163,10 @@ export function analyzeStorageLayout(
   }
 
   // Gap validation (STOR-007, STOR-008)
-  validateGaps(oldLayout, newLayout, findings);
+  // Pass the total count of appended new variables so the gap-insufficiency check can use it.
+  // newVars are variables that appear in newLayout but not in oldLayout at any slot.
+  const totalNewVarsAdded = newVars.length;
+  validateGaps(oldLayout, newLayout, findings, totalNewVarsAdded);
 
   return { status: "completed", findings };
 }
@@ -150,18 +175,16 @@ function validateGaps(
   oldLayout: CanonicalStorageEntry[],
   newLayout: CanonicalStorageEntry[],
   findings: Finding[],
+  totalNewVarsAdded: number,
 ): void {
-  const gapRegex = /gap$/i;
-  const oldGaps = oldLayout.filter(
-    (e) => gapRegex.test(e.label) && e.canonicalType.startsWith("uint256["),
-  );
-  const newGaps = newLayout.filter(
-    (e) => gapRegex.test(e.label) && e.canonicalType.startsWith("uint256["),
-  );
+  const oldGaps = oldLayout.filter(isGapEntry);
+  const newGaps = newLayout.filter(isGapEntry);
 
   for (const oldGap of oldGaps) {
     const oldN = extractArraySize(oldGap.canonicalType);
-    const matchingNewGap = newGaps.find((g) => g.contractOrigin === oldGap.contractOrigin);
+
+    // Match new gap by slot position — contractOrigin differs across contract versions
+    const matchingNewGap = newGaps.find((g) => g.slot === oldGap.slot);
 
     if (!matchingNewGap) {
       findings.push({
@@ -170,9 +193,9 @@ function validateGaps(
         confidence: "HIGH_CONFIDENCE",
         title: "Storage gap removed",
         description:
-          `Storage gap "${oldGap.label}" in ${oldGap.contractOrigin} was removed entirely ` +
+          `Storage gap "${oldGap.label}" at slot ${oldGap.slot} was removed entirely ` +
           `in the new implementation.`,
-        details: { oldGapSize: oldN, contract: oldGap.contractOrigin },
+        details: { oldGapSize: oldN, slot: oldGap.slot },
         location: { slot: oldGap.slot, contract: oldGap.contractOrigin },
         remediation:
           "Do not remove storage gaps. If adding new variables, decrement the gap size by " +
@@ -182,23 +205,20 @@ function validateGaps(
     }
 
     const newN = extractArraySize(matchingNewGap.canonicalType);
-    const newVarsAfterGap = newLayout.filter(
-      (e) =>
-        e.contractOrigin === oldGap.contractOrigin &&
-        e.slot > oldGap.slot &&
-        !gapRegex.test(e.label),
-    ).length;
 
-    if (newN + newVarsAfterGap < oldN) {
+    // The invariant is: newGapSize + totalNewVarsAdded == oldGapSize.
+    // Variables can be appended before or after the gap — what matters is the total count,
+    // not their position relative to the gap slot.
+    if (newN + totalNewVarsAdded < oldN) {
       findings.push({
         code: "STOR-007",
         severity: "HIGH",
         confidence: "HIGH_CONFIDENCE",
         title: "Storage gap insufficient",
         description:
-          `Gap shrank by ${oldN - newN} slots but only ${newVarsAfterGap} new variable(s) added. ` +
-          `Expected ${newN} + ${newVarsAfterGap} = ${newN + newVarsAfterGap} >= ${oldN}.`,
-        details: { oldGapSize: oldN, newGapSize: newN, newVarsAdded: newVarsAfterGap },
+          `Gap shrank by ${oldN - newN} slots but only ${totalNewVarsAdded} new variable(s) added. ` +
+          `Expected ${newN} + ${totalNewVarsAdded} = ${newN + totalNewVarsAdded} >= ${oldN}.`,
+        details: { oldGapSize: oldN, newGapSize: newN, newVarsAdded: totalNewVarsAdded },
         location: { slot: matchingNewGap.slot, contract: oldGap.contractOrigin },
         remediation:
           "The gap must decrease by exactly the number of new storage slots used. " +

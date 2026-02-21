@@ -11,11 +11,17 @@ export interface NormalizedFunction {
   stateMutability: string;
 }
 
+export interface NormalizedEventInput {
+  type: string;
+  indexed: boolean;
+}
+
 export interface NormalizedEvent {
   topic0: string; // keccak256 of event signature
   signature: string;
   name: string;
-  inputs: string[];
+  inputs: string[]; // type strings (for backward compat)
+  indexedInputs: NormalizedEventInput[]; // full input info including indexed flag
 }
 
 export interface ExtractedAbi {
@@ -63,6 +69,10 @@ export async function extractAbi(
         signature: sig,
         name: item.name,
         inputs: inputs.map((i) => i.type),
+        indexedInputs: inputs.map((i) => ({
+          type: i.type as string,
+          indexed: (i as Record<string, unknown>)["indexed"] === true,
+        })),
       });
     }
   }
